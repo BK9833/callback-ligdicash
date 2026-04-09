@@ -1,0 +1,75 @@
+version: "3.9"
+
+services:
+
+  # ── Application PHP ──────────────────────────────────────────────────────
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ligdicash-callback
+    ports:
+      - "8080:10000"
+    environment:
+      PORT: "10000"
+      DB_HOST:     db
+      DB_PORT:     "3306"
+      DB_NAME:     callback_mregistre
+      DB_USER:     ligdicash
+      DB_PASSWORD: secret
+      LIGDICASH_API_KEY:      ""
+      LIGDICASH_API_TOKEN:    ""
+      FIREBASE_PROJECT_ID:    ""
+      FIREBASE_CLIENT_EMAIL:  ""
+      FIREBASE_PRIVATE_KEY:   ""
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - ligdicash-net
+
+  # ── MySQL local (dev uniquement) ─────────────────────────────────────────
+  db:
+    image: mysql:8.0
+    container_name: ligdicash-mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpassword
+      MYSQL_DATABASE:      callback_mregistre
+      MYSQL_USER:          ligdicash
+      MYSQL_PASSWORD:      secret
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./schema.sql:/docker-entrypoint-initdb.d/schema.sql:ro
+    ports:
+      - "3307:3306"
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uligdicash", "-psecret"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - ligdicash-net
+
+  # ── phpMyAdmin (dev uniquement) ──────────────────────────────────────────
+  phpmyadmin:
+    image: phpmyadmin:latest
+    container_name: ligdicash-phpmyadmin
+    environment:
+      PMA_HOST:     db
+      PMA_PORT:     3306
+      PMA_USER:     ligdicash
+      PMA_PASSWORD: secret
+    ports:
+      - "8081:80"
+    depends_on:
+      - db
+    networks:
+      - ligdicash-net
+
+volumes:
+  mysql_data:
+
+networks:
+  ligdicash-net:
+    driver: bridge
