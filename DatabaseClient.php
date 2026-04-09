@@ -1,44 +1,228 @@
 <?php
 /**
- * DatabaseClient.php — Client MySQL via PDO (Singleton)
- * Compatible InfinityFree (MySQL 5.x / 8.x)
+ * DatabaseClient.php — Client Firestore REST API
+ *
+ * Remplace PDO/MySQL. Utilise les mêmes credentials Firebase que FcmClient.
+ *
+ * Collections Firestore :
+ *   payment_transactions  — doc ID = invoice_token
+ *   subscriptions         — doc ID = user_id  (1 doc par user, upsert)
+ *   fcm_tokens            — doc ID = user_id  (1 doc par user, upsert)
  */
 declare(strict_types=1);
 
 class DatabaseClient
 {
-    private static ?PDO $pdo = null;
+    // ── Auth (token OAuth2 partagé avec FcmClient) ─────────────────────────
 
-    // ── Connexion ──────────────────────────────────────────────────────────
+    private static ?string $accessToken = null;
+    private static int     $tokenExpiry  = 0;
 
-    public static function getPdo(): PDO
+    private static function getAccessToken(): string
     {
-        if (self::$pdo !== null) {
-            return self::$pdo;
+        if (self::$accessToken !== null && time() < self::$tokenExpiry - 60) {
+            return self::$accessToken;
         }
 
-        date_default_timezone_set('UTC');
+        $now    = time();
+        $header = self::b64u(json_encode(['alg' => 'RS256', 'typ' => 'JWT']));
+        $claims = self::b64u(json_encode([
+            'iss'   => FIREBASE_CLIENT_EMAIL,
+            'sub'   => FIREBASE_CLIENT_EMAIL,
+            'aud'   => 'https://oauth2.googleapis.com/token',
+            'iat'   => $now,
+            'exp'   => $now + 3600,
+            'scope' => implode(' ', [
+                'https://www.googleapis.com/auth/datastore',
+                'https://www.googleapis.com/auth/firebase.messaging',
+            ]),
+        ]));
 
-        $dsn = sprintf(
-            'mysql:host=%s;port=%s;dbname=%s;charset=%s',
-            DB_HOST, DB_PORT, DB_NAME, DB_CHARSET
-        );
+        $unsigned = $header . '.' . $claims;
+        openssl_sign($unsigned, $sig, FIREBASE_PRIVATE_KEY, OPENSSL_ALGO_SHA256);
+        $jwt = $unsigned . '.' . self::b64u($sig);
 
-        try {
-            self::$pdo = new PDO($dsn, DB_USER, DB_PASSWORD, [
-                PDO::ATTR_ERRMODE            => PDO::ERRMODE_EXCEPTION,
-                PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
-                PDO::ATTR_EMULATE_PREPARES   => false,
-                PDO::ATTR_TIMEOUT            => 5,
-            ]);
-            self::$pdo->exec("SET time_zone = '+00:00'");
-        } catch (PDOException $e) {
-            error_log('[DB] Connexion échouée : ' . $e->getMessage());
-            throw new RuntimeException('Connexion base de données échouée.');
+        $ch = curl_init('https://oauth2.googleapis.com/token');
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_POST           => true,
+            CURLOPT_TIMEOUT        => 10,
+            CURLOPT_POSTFIELDS     => http_build_query([
+                'grant_type' => 'urn:ietf:params:oauth:grant-type:jwt-bearer',
+                'assertion'  => $jwt,
+            ]),
+        ]);
+        $res = json_decode((string)curl_exec($ch), true);
+        curl_close($ch);
+
+        if (empty($res['access_token'])) {
+            throw new RuntimeException('[DB] OAuth2 échoué : ' . json_encode($res));
         }
 
-        return self::$pdo;
+        self::$accessToken = $res['access_token'];
+        self::$tokenExpiry = $now + (int)($res['expires_in'] ?? 3600);
+
+        return self::$accessToken;
     }
+
+    // ── Helpers REST ───────────────────────────────────────────────────────
+
+    /** URL de base Firestore REST pour ce projet */
+    private static function base(): string
+    {
+        return sprintf(
+            'https://firestore.googleapis.com/v1/projects/%s/databases/(default)/documents',
+            FIREBASE_PROJECT_ID
+        );
+    }
+
+    /** Requête HTTP vers Firestore */
+    private static function request(
+        string  $method,
+        string  $url,
+        ?array  $body = null,
+        array   $query = []
+    ): array {
+        if ($query) {
+            $url .= '?' . http_build_query($query);
+        }
+
+        $token = self::getAccessToken();
+        $ch    = curl_init($url);
+        $opts  = [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_TIMEOUT        => 10,
+            CURLOPT_CUSTOMREQUEST  => $method,
+            CURLOPT_HTTPHEADER     => [
+                'Authorization: Bearer ' . $token,
+                'Content-Type: application/json',
+            ],
+        ];
+        if ($body !== null) {
+            $opts[CURLOPT_POSTFIELDS] = json_encode($body, JSON_UNESCAPED_UNICODE);
+        }
+        curl_setopt_array($ch, $opts);
+        $raw  = (string)curl_exec($ch);
+        $code = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        curl_close($ch);
+
+        $data = json_decode($raw, true) ?? [];
+
+        if ($code >= 400 && $code !== 404) {
+            $msg = $data['error']['message'] ?? $raw;
+            throw new RuntimeException("[DB] Firestore HTTP $code : $msg");
+        }
+
+        return ['code' => $code, 'data' => $data];
+    }
+
+    /** GET d'un document — null si inexistant */
+    private static function getDoc(string $collection, string $docId): ?array
+    {
+        $url = self::base() . "/$collection/" . rawurlencode($docId);
+        $res = self::request('GET', $url);
+        return ($res['code'] === 404) ? null : ($res['data'] ?? null);
+    }
+
+    /** PATCH (create or update) d'un document Firestore */
+    private static function setDoc(string $collection, string $docId, array $fields): void
+    {
+        $url  = self::base() . "/$collection/" . rawurlencode($docId);
+        $body = ['fields' => self::toFirestore($fields)];
+
+        // updateMask pour ne mettre à jour que les champs fournis
+        $mask = array_keys($fields);
+        self::request('PATCH', $url, $body, array_map(
+            fn($f) => ['updateMask.fieldPaths' => $f],
+            $mask
+        ));
+    }
+
+    /**
+     * PATCH avec updateMask explicite (liste de champs à écraser).
+     * Permet l'upsert partiel sans toucher aux champs absents.
+     */
+    private static function patchDoc(string $collection, string $docId, array $fields): void
+    {
+        $url   = self::base() . "/$collection/" . rawurlencode($docId);
+        $body  = ['fields' => self::toFirestore($fields)];
+        $query = [];
+        foreach (array_keys($fields) as $f) {
+            $query[] = 'updateMask.fieldPaths=' . urlencode($f);
+        }
+        $qs = implode('&', $query);
+
+        $token = self::getAccessToken();
+        $ch    = curl_init($url . '?' . $qs);
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_TIMEOUT        => 10,
+            CURLOPT_CUSTOMREQUEST  => 'PATCH',
+            CURLOPT_POSTFIELDS     => json_encode($body, JSON_UNESCAPED_UNICODE),
+            CURLOPT_HTTPHEADER     => [
+                'Authorization: Bearer ' . $token,
+                'Content-Type: application/json',
+            ],
+        ]);
+        $raw  = (string)curl_exec($ch);
+        $code = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        curl_close($ch);
+
+        if ($code >= 400) {
+            $err = json_decode($raw, true)['error']['message'] ?? $raw;
+            throw new RuntimeException("[DB] patchDoc $collection/$docId HTTP $code : $err");
+        }
+    }
+
+    // ── Conversions Firestore ↔ PHP ────────────────────────────────────────
+
+    /** Convertit un tableau PHP plat en champs Firestore */
+    private static function toFirestore(array $data): array
+    {
+        $fields = [];
+        foreach ($data as $k => $v) {
+            if ($v === null) {
+                $fields[$k] = ['nullValue' => null];
+            } elseif (is_bool($v)) {
+                $fields[$k] = ['booleanValue' => $v];
+            } elseif (is_int($v)) {
+                $fields[$k] = ['integerValue' => (string)$v];
+            } elseif (is_float($v)) {
+                $fields[$k] = ['doubleValue' => $v];
+            } elseif (is_array($v)) {
+                $fields[$k] = ['stringValue' => json_encode($v, JSON_UNESCAPED_UNICODE)];
+            } else {
+                $fields[$k] = ['stringValue' => (string)$v];
+            }
+        }
+        return $fields;
+    }
+
+    /** Extrait les valeurs PHP d'un document Firestore */
+    private static function fromFirestore(array $doc): array
+    {
+        $out = [];
+        foreach ($doc['fields'] ?? [] as $k => $fv) {
+            $out[$k] = match (true) {
+                isset($fv['stringValue'])  => $fv['stringValue'],
+                isset($fv['integerValue']) => (int)$fv['integerValue'],
+                isset($fv['doubleValue'])  => (float)$fv['doubleValue'],
+                isset($fv['booleanValue']) => $fv['booleanValue'],
+                isset($fv['nullValue'])    => null,
+                default                    => null,
+            };
+        }
+        return $out;
+    }
+
+    private static function b64u(string $data): string
+    {
+        return rtrim(strtr(base64_encode($data), '+/', '-_'), '=');
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // API publique — même signature que l'ancienne version MySQL
+    // ═══════════════════════════════════════════════════════════════════════
 
     // ── Transactions ───────────────────────────────────────────────────────
 
@@ -47,23 +231,20 @@ class DatabaseClient
      */
     public static function transactionExists(string $invoiceToken): bool
     {
-        $stmt = self::getPdo()->prepare(
-            'SELECT COUNT(*) FROM payment_transactions WHERE invoice_token = ?'
-        );
-        $stmt->execute([$invoiceToken]);
-        return (int)$stmt->fetchColumn() > 0;
+        $doc = self::getDoc('payment_transactions', $invoiceToken);
+        return $doc !== null;
     }
 
     /**
-     * Insère ou met à jour une transaction (ON DUPLICATE KEY UPDATE).
+     * Insère ou met à jour une transaction.
      */
     public static function recordTransaction(
         string  $invoiceToken,
         string  $userId,
         string  $plan,
         string  $localOrderId,
-        string  $status,          // completed | pending | nocompleted
-        array   $payload,         // payload brut complet
+        string  $status,
+        array   $payload,
         ?string $operatorName  = null,
         ?string $transactionId = null,
         int     $amount         = 0,
@@ -71,73 +252,38 @@ class DatabaseClient
     ): void {
         $now = (new DateTimeImmutable('now', new DateTimeZone('UTC')))->format('Y-m-d H:i:s');
 
-        $startDate = isset($extra['startDate'])
-            ? (new DateTimeImmutable($extra['startDate']))->format('Y-m-d H:i:s')
-            : null;
-        $endDate = isset($extra['endDate'])
-            ? (new DateTimeImmutable($extra['endDate']))->format('Y-m-d H:i:s')
-            : null;
-        $processedAt = !empty($extra['processedAt'])
-            ? (new DateTimeImmutable($extra['processedAt']))->format('Y-m-d H:i:s')
-            : null;
+        $fields = [
+            'invoice_token'  => $invoiceToken,
+            'user_id'        => $userId,
+            'plan'           => $plan,
+            'local_order_id' => $localOrderId,
+            'status'         => $status,
+            'provider'       => 'ligdicash',
+            'operator_name'  => $operatorName  ?? '',
+            'transaction_id' => $transactionId ?? '',
+            'amount'         => $amount,
+            'response_code'  => $extra['responseCode'] ?? '',
+            'response_text'  => $extra['responseText'] ?? '',
+            'customer'       => $extra['customer']      ?? '',
+            'external_id'    => $extra['externalId']    ?? '',
+            'request_id'     => $extra['requestId']     ?? '',
+            'raw_payload'    => json_encode($payload, JSON_UNESCAPED_UNICODE),
+            'processed_at'   => $extra['processedAt']   ?? '',
+            'duration_days'  => $extra['durationDays']  ?? 0,
+            'start_date'     => $extra['startDate']     ?? '',
+            'end_date'       => $extra['endDate']       ?? '',
+            'created_at'     => $now,
+            'updated_at'     => $now,
+        ];
 
-        $stmt = self::getPdo()->prepare('
-            INSERT INTO payment_transactions
-                (invoice_token, user_id, plan, local_order_id, status,
-                 provider, operator_name, transaction_id, amount,
-                 response_code, response_text, customer, external_id,
-                 request_id, raw_payload, processed_at, duration_days,
-                 start_date, end_date, created_at)
-            VALUES
-                (:invoice_token, :user_id, :plan, :local_order_id, :status,
-                 :provider, :operator_name, :transaction_id, :amount,
-                 :response_code, :response_text, :customer, :external_id,
-                 :request_id, :raw_payload, :processed_at, :duration_days,
-                 :start_date, :end_date, :created_at)
-            ON DUPLICATE KEY UPDATE
-                status         = VALUES(status),
-                operator_name  = VALUES(operator_name),
-                transaction_id = VALUES(transaction_id),
-                amount         = VALUES(amount),
-                response_code  = VALUES(response_code),
-                response_text  = VALUES(response_text),
-                processed_at   = VALUES(processed_at),
-                duration_days  = VALUES(duration_days),
-                start_date     = VALUES(start_date),
-                end_date       = VALUES(end_date),
-                raw_payload    = VALUES(raw_payload)
-        ');
-
-        $stmt->execute([
-            ':invoice_token'  => $invoiceToken,
-            ':user_id'        => $userId,
-            ':plan'           => $plan,
-            ':local_order_id' => $localOrderId,
-            ':status'         => $status,
-            ':provider'       => 'ligdicash',
-            ':operator_name'  => $operatorName,
-            ':transaction_id' => $transactionId,
-            ':amount'         => $amount,
-            ':response_code'  => $extra['responseCode']  ?? null,
-            ':response_text'  => $extra['responseText']  ?? null,
-            ':customer'       => $extra['customer']       ?? null,
-            ':external_id'    => $extra['externalId']     ?? null,
-            ':request_id'     => $extra['requestId']      ?? null,
-            ':raw_payload'    => json_encode($payload, JSON_UNESCAPED_UNICODE),
-            ':processed_at'   => $processedAt,
-            ':duration_days'  => $extra['durationDays']   ?? null,
-            ':start_date'     => $startDate,
-            ':end_date'       => $endDate,
-            ':created_at'     => $now,
-        ]);
-
+        self::patchDoc('payment_transactions', $invoiceToken, $fields);
         error_log("[DB] Transaction enregistrée : $invoiceToken (status=$status, plan=$plan, user=$userId)");
     }
 
     // ── Abonnements ────────────────────────────────────────────────────────
 
     /**
-     * Active ou renouvelle un abonnement (ON DUPLICATE KEY UPDATE sur user_id).
+     * Active ou renouvelle un abonnement (upsert sur user_id).
      */
     public static function activateSubscription(
         string            $userId,
@@ -148,51 +294,47 @@ class DatabaseClient
         DateTimeImmutable $startDate,
         DateTimeImmutable $endDate
     ): void {
-        $stmt = self::getPdo()->prepare('
-            INSERT INTO subscriptions
-                (user_id, plan, status, start_date, end_date,
-                 demo_used, last_order_id, last_invoice_token,
-                 payment_method, created_at, updated_at)
-            VALUES
-                (:user_id, :plan, "active", :start_date, :end_date,
-                 0, :last_order_id, :last_invoice_token,
-                 :payment_method, NOW(), NOW())
-            ON DUPLICATE KEY UPDATE
-                plan               = VALUES(plan),
-                status             = "active",
-                start_date         = VALUES(start_date),
-                end_date           = VALUES(end_date),
-                last_order_id      = VALUES(last_order_id),
-                last_invoice_token = VALUES(last_invoice_token),
-                payment_method     = VALUES(payment_method),
-                updated_at         = NOW()
-        ');
+        $now = (new DateTimeImmutable('now', new DateTimeZone('UTC')))->format('Y-m-d H:i:s');
 
-        $stmt->execute([
-            ':user_id'            => $userId,
-            ':plan'               => $plan,
-            ':start_date'         => $startDate->format('Y-m-d H:i:s'),
-            ':end_date'           => $endDate->format('Y-m-d H:i:s'),
-            ':last_order_id'      => $localOrderId,
-            ':last_invoice_token' => $invoiceToken,
-            ':payment_method'     => $paymentMethod ?? 'ligdicash',
-        ]);
+        $fields = [
+            'user_id'             => $userId,
+            'plan'                => $plan,
+            'status'              => 'active',
+            'start_date'          => $startDate->format('Y-m-d H:i:s'),
+            'end_date'            => $endDate->format('Y-m-d H:i:s'),
+            'last_order_id'       => $localOrderId,
+            'last_invoice_token'  => $invoiceToken,
+            'payment_method'      => $paymentMethod ?? 'ligdicash',
+            'updated_at'          => $now,
+        ];
 
+        // Vérifie si le doc existe pour préserver created_at et demo_used
+        $existing = self::getDoc('subscriptions', $userId);
+        if ($existing === null) {
+            $fields['created_at'] = $now;
+            $fields['demo_used']  = 0;
+        }
+
+        self::patchDoc('subscriptions', $userId, $fields);
         error_log("[DB] Abonnement activé : $userId (plan=$plan, fin={$endDate->format('Y-m-d')})");
     }
 
     /**
-     * Expire un abonnement pending si le paiement échoue.
+     * Passe un abonnement pending en expired si le paiement échoue.
      */
     public static function clearPendingSubscription(string $userId, string $invoiceToken): void
     {
         try {
-            $stmt = self::getPdo()->prepare('
-                UPDATE subscriptions
-                SET    status = "expired", updated_at = NOW()
-                WHERE  user_id = ? AND last_invoice_token = ? AND status = "pending"
-            ');
-            $stmt->execute([$userId, $invoiceToken]);
+            $doc = self::getDoc('subscriptions', $userId);
+            if ($doc === null) return;
+
+            $data = self::fromFirestore($doc);
+            if (($data['status'] ?? '') === 'pending' && ($data['last_invoice_token'] ?? '') === $invoiceToken) {
+                self::patchDoc('subscriptions', $userId, [
+                    'status'     => 'expired',
+                    'updated_at' => (new DateTimeImmutable('now', new DateTimeZone('UTC')))->format('Y-m-d H:i:s'),
+                ]);
+            }
         } catch (Throwable $e) {
             error_log('[DB] clearPending erreur : ' . $e->getMessage());
         }
@@ -202,21 +344,39 @@ class DatabaseClient
 
     public static function getFcmTokensForUser(string $userId): array
     {
-        $stmt = self::getPdo()->prepare(
-            'SELECT token FROM fcm_tokens WHERE user_id = ?'
-        );
-        $stmt->execute([$userId]);
-        return $stmt->fetchAll(PDO::FETCH_COLUMN);
+        $doc = self::getDoc('fcm_tokens', $userId);
+        if ($doc === null) return [];
+
+        $data = self::fromFirestore($doc);
+        $token = $data['token'] ?? '';
+        return $token !== '' ? [$token] : [];
     }
 
     public static function saveFcmToken(string $userId, string $token): void
     {
-        $stmt = self::getPdo()->prepare('
-            INSERT INTO fcm_tokens (user_id, token, created_at, updated_at)
-            VALUES (:user_id, :token, NOW(), NOW())
-            ON DUPLICATE KEY UPDATE token = VALUES(token), updated_at = NOW()
-        ');
-        $stmt->execute([':user_id' => $userId, ':token' => $token]);
+        $now = (new DateTimeImmutable('now', new DateTimeZone('UTC')))->format('Y-m-d H:i:s');
+        self::patchDoc('fcm_tokens', $userId, [
+            'user_id'    => $userId,
+            'token'      => $token,
+            'updated_at' => $now,
+        ]);
         error_log("[FCM] Token enregistré pour user=$userId");
+    }
+
+    // ── Healthcheck ────────────────────────────────────────────────────────
+
+    /**
+     * Teste la connectivité Firestore (lecture d'un doc fictif).
+     * Retourne true si l'API répond (même 404 = OK).
+     */
+    public static function ping(): bool
+    {
+        try {
+            self::getDoc('_health', 'ping');
+            return true;
+        } catch (Throwable $e) {
+            error_log('[DB] ping échoué : ' . $e->getMessage());
+            return false;
+        }
     }
 }
