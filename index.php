@@ -31,8 +31,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
 
 // ── Routeur ────────────────────────────────────────────────────────────────
 $method = $_SERVER['REQUEST_METHOD'];
-$path   = rtrim(parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH) ?? '/', '/') ?: '/';
+$path = parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH) ?? '/';
 
+// 🔥 SUPPRESSION DE /index.php
+$path = str_replace('/index.php', '', $path);
+
+// Nettoyage final
+$path = rtrim($path, '/') ?: '/';
 $t0 = microtime(true);
 
 match (true) {
