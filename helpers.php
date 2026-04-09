@@ -92,10 +92,10 @@ function cancelPage(): never
 // ── Healthcheck Render ─────────────────────────────────────────────────────
 function healthHandler(): never
 {
-    try {
-        DatabaseClient::getPdo(); // teste la connexion DB
-        jsonResponse(['status' => 'ok', 'db' => 'connected', 'ts' => date('c')]);
-    } catch (Throwable) {
-        jsonResponse(['status' => 'degraded', 'db' => 'unreachable', 'ts' => date('c')], 503);
+    $ok = DatabaseClient::ping();
+    if ($ok) {
+        jsonResponse(['status' => 'ok', 'db' => 'connected', 'provider' => 'firestore', 'ts' => date('c')]);
+    } else {
+        jsonResponse(['status' => 'degraded', 'db' => 'unreachable', 'provider' => 'firestore', 'ts' => date('c')], 503);
     }
 }
