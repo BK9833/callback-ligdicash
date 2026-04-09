@@ -1,6 +1,7 @@
 <?php
 /**
  * config.php — Variables d'environnement + constantes globales
+ * BD : Firestore (plus de MySQL)
  */
 declare(strict_types=1);
 
@@ -20,15 +21,7 @@ function env(string $key, string $default = ''): string
 defined('LIGDICASH_API_KEY')   || define('LIGDICASH_API_KEY',   env('LIGDICASH_API_KEY'));
 defined('LIGDICASH_API_TOKEN') || define('LIGDICASH_API_TOKEN', env('LIGDICASH_API_TOKEN'));
 
-// ── MySQL ──────────────────────────────────────────────────────────────────
-defined('DB_HOST')     || define('DB_HOST',     env('DB_HOST',     'sql310.infinityfree.com'));
-defined('DB_PORT')     || define('DB_PORT',     env('DB_PORT',     '3306'));
-defined('DB_NAME')     || define('DB_NAME',     env('DB_NAME'));
-defined('DB_USER')     || define('DB_USER',     env('DB_USER'));
-defined('DB_PASSWORD') || define('DB_PASSWORD', env('DB_PASSWORD'));
-defined('DB_CHARSET')  || define('DB_CHARSET',  'utf8mb4');
-
-// ── Firebase FCM ───────────────────────────────────────────────────────────
+// ── Firebase / Firestore ───────────────────────────────────────────────────
 defined('FIREBASE_PROJECT_ID')   || define('FIREBASE_PROJECT_ID',   env('FIREBASE_PROJECT_ID'));
 defined('FIREBASE_CLIENT_EMAIL') || define('FIREBASE_CLIENT_EMAIL', env('FIREBASE_CLIENT_EMAIL'));
 defined('FIREBASE_PRIVATE_KEY')  || define('FIREBASE_PRIVATE_KEY',
